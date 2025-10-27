@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>YW Format Merger (Ordering + Robust Parser) — Fixed</title>
+<style>
+  body { font-family: sans-serif; margin: 20px; background: #f8f9fa; }
+  textarea { width: 48%; height: 220px; margin: 5px; padding: 10px; font-family: monospace; }
+  button { padding: 8px 12px; margin: 8px 6px; }
+  .section { background: #fff; border: 1px solid #ddd; border-radius: 10px; margin: 10px 0; padding: 10px; }
+  .conflict { background: #fff6f6; border-left: 4px solid #e63946; padding: 8px; margin: 8px 0; border-radius:6px; }
+  .merged-output { width: 100%; height: 260px; margin-top: 12px; padding:10px; font-family: monospace; }
+  .meta { color:#556; font-size:13px; }
+  .controls { margin:8px 0 12px 0; }
+  label { user-select:none; }
+  .sample { font-size:12px; color:#444; background:#fbfbfb; padding:8px; border-radius:6px; border:1px dashed #e0e0e0; }
+</style>
+</head>
+<body>
+
+<h2>YW Format Merger</h2>
+<p class="meta">Robust tokenizer + bracket-aware parser. Preserves ordering from Version A, appends extras from Version B.</p>
+
+<div style="display:flex;gap:2%;">
+  <textarea id="inputA" placeholder="Paste Version A here">YW1 [
+    CHARA_BASE_YOKAI_INFO (
+        BaseID|False
+        FileNamePrefix|yokai_
+        NameID|100
+    )
+
+    CHARA_PARAM_INFO (
+        ParamID|False
+        BaseID|1
+    )
+]
+</textarea>
+  <textarea id="inputB" placeholder="Paste Version B here">YW1 [
+    CHARA_BASE_YOKAI_INFO (
+        BaseID|False
+        FileNamePrefix|yokai_
+        NameID|200
+        Unk1|12
+    )
+
+    CHARA_PARAM_INFO (
+        ParamID|True
+        BaseID|1
+    )
+]
+
+YW2 [
+    EXTRA_SECTION (
+        KeyA|ValueA
+    )
+]
+</textarea>
+</div>
+
+<div class="controls">
+  <label><input type="checkbox" id="autoTrue"> Auto-resolve True/False conflicts by picking <strong>True</strong></label>
+  <button id="mergeBtn">Merge</button>
+  <button id="downloadBtn">Download merged .txt</button>
+</div>
+
+<div id="results"></div>
+
+<h3>Merged Output</h3>
+<textarea id="mergedOutput" class="merged-output" readonly></textarea>
+
+<script> /* hopefully not broken this time :P */
+// Globals
+let conflictSelections = {}; // map "block:section:key" -> chosen value
+let parsedA_global = [];
+let parsedB_global = [];
+const resultsDiv = document.getElementById('results');
+// --- PARSER UPDATE: handle special characters in keys/values ---
+function tokenize(input) {
+    const tokens = [];
+    // Match: NEWLINE | brackets/pipe | any non-whitespace except brackets/pipe
+    const re = /(\r?\n)|(\[|\]|\(|\)|\|)|([^\s\[\]\(\)\|]+)/g;
+    let m;
+    while ((m = re.exec(input)) !== null) {
+        if (m[1]) tokens.push({ type: 'NEWLINE' });
+        else if (m[2]) tokens.push({ type: m[2] });
+        else if (m[3]) tokens.push({ type: 'IDENT', value: m[3] });
+    }
+    return tokens;
+}
+
+
+
+// --- MERGE UPDATE: positional conflict-aware ---
+function merge() {
+    const textA = document.getElementById('inputA').value;
+    const textB = document.getElementById('inputB').value;
+    const autoTrueEnabled = document.getElementById('autoTrue').checked;
+
+    let parsedA, parsedB;
+    try { parsedA = parseYW(textA); } catch (err) { alert('Error parsing Version A: ' + err.message); return; }
+    try { parsedB = parseYW(textB); } catch (err) { alert('Error parsing Version B: ' + err.message); return; }
+
+    parsedA_global = parsedA;
+    parsedB_global = parsedB;
+
+    const blocksB = Object.fromEntries(parsedB.map(b => [b.id, b]));
+    const allBlocks = [...parsedA.map(b => b.id), ...parsedB.filter(b => !parsedA.some(a => a.id === b.id)).map(b => b.id)];
+
+    conflictSelections = {};
+    resultsDiv.innerHTML = '';
+
+    allBlocks.forEach(blockId => {
+        const A = parsedA.find(b => b.id === blockId);
+        const B = blocksB[blockId];
+
+        const blockDiv = document.createElement('div');
+        blockDiv.className = 'section';
+        const origins = [];
+        if(A) origins.push('A');
+        if(B) origins.push('B');
+        blockDiv.innerHTML = `<h3>${blockId} <small class="meta">(present in: ${origins.join(', ')})</small></h3>`;
+
+        const sectionsA = A ? Object.fromEntries(A.sections.map(s=>[s.id,s])) : {};
+        const sectionsB = B ? Object.fromEntries(B.sections.map(s=>[s.id,s])) : {};
+        const sectionOrder = [...(A ? A.sections.map(s=>s.id) : []), ...Object.keys(sectionsB).filter(id=>!sectionsA[id])];
+
+        sectionOrder.forEach(secId => {
+            const secA = sectionsA[secId] || {id:secId, pairs:[]};
+            const secB = sectionsB[secId] || {id:secId, pairs:[]};
+
+            const len = Math.max(secA.pairs.length, secB.pairs.length);
+            const secBox = document.createElement('div');
+            secBox.innerHTML = `<h4>${secId}</h4>`;
+
+            for(let idx=0; idx<len; idx++){
+                const pairA = secA.pairs[idx];
+                const pairB = secB.pairs[idx];
+
+                if(pairA && pairB){
+                    // positional key conflict
+                    if(pairA.key !== pairB.key){
+                        const mapKey = `${blockId}:${secId}:pos${idx}`;
+                        conflictSelections[mapKey] = pairA.key;
+
+                        const conflictDiv = document.createElement('div');
+                        conflictDiv.className = 'conflict';
+
+                        const groupName = sanitizeName(mapKey);
+
+                        const radioA = document.createElement('input');
+                        radioA.type='radio'; radioA.name=groupName; radioA.value=pairA.key; radioA.checked=true;
+                        radioA.dataset.mapKey = mapKey;
+                        const labelA = document.createElement('label'); labelA.appendChild(radioA);
+                        labelA.appendChild(document.createTextNode(' A: '+pairA.key));
+
+                        const radioB = document.createElement('input');
+                        radioB.type='radio'; radioB.name=groupName; radioB.value=pairB.key;
+                        radioB.dataset.mapKey = mapKey;
+                        const labelB = document.createElement('label'); labelB.style.marginLeft='8px';
+                        labelB.appendChild(radioB); labelB.appendChild(document.createTextNode(' B: '+pairB.key));
+
+                        const title = document.createElement('div');
+                        title.innerHTML = `<strong>Positional Key Conflict at param ${idx+1}:</strong>`;
+                        conflictDiv.appendChild(title); conflictDiv.appendChild(labelA); conflictDiv.appendChild(document.createElement('br')); conflictDiv.appendChild(labelB);
+
+                        secBox.appendChild(conflictDiv);
+                        continue;
+                    }
+
+                    // value conflict
+                    if(pairA.value !== pairB.value){
+                        // auto-unk rule for left side
+                        if(/unk/i.test(pairA.key) && pairA.value.toLowerCase()==='false' && pairB.value.toLowerCase() !== 'false'){
+                            conflictSelections[`${blockId}:${secId}:${pairA.key}`] = pairB.value;
+                            continue;
+                        }
+
+                        // auto-true
+                        if(autoTrueEnabled && ((pairA.value.toLowerCase()==='true' && pairB.value.toLowerCase()==='false') || (pairB.value.toLowerCase()==='true' && pairA.value.toLowerCase()==='false'))){
+                            conflictSelections[`${blockId}:${secId}:${pairA.key}`]='True';
+                            continue;
+                        }
+
+                        // manual conflict
+                        const mapKey = `${blockId}:${secId}:${pairA.key}`;
+                        conflictSelections[mapKey]=pairA.value;
+
+                        const conflictDiv = document.createElement('div');
+                        conflictDiv.className='conflict';
+                        const groupName = sanitizeName(mapKey);
+
+                        const radioA = document.createElement('input');
+                        radioA.type='radio'; radioA.name=groupName; radioA.value=pairA.value; radioA.checked=true;
+                        radioA.dataset.mapKey = mapKey;
+                        const labelA = document.createElement('label'); labelA.appendChild(radioA);
+                        labelA.appendChild(document.createTextNode(' A: '+pairA.value));
+
+                        const radioB = document.createElement('input');
+                        radioB.type='radio'; radioB.name=groupName; radioB.value=pairB.value;
+                        radioB.dataset.mapKey = mapKey;
+                        const labelB = document.createElement('label'); labelB.style.marginLeft='8px';
+                        labelB.appendChild(radioB); labelB.appendChild(document.createTextNode(' B: '+pairB.value));
+
+                        const title = document.createElement('div');
+                        title.innerHTML = `<strong>Value Conflict:</strong> ${pairA.key}`;
+                        conflictDiv.appendChild(title); conflictDiv.appendChild(labelA); conflictDiv.appendChild(document.createElement('br')); conflictDiv.appendChild(labelB);
+
+                        secBox.appendChild(conflictDiv);
+                    }
+                }
+            }
+
+            // append extra pairs from longer side
+            if(secA.pairs.length > len) secA.pairs.slice(len).forEach(p=>secBox.appendChild(document.createTextNode(`Extra A: ${p.key}|${p.value}`)));
+            if(secB.pairs.length > len) secB.pairs.slice(len).forEach(p=>secBox.appendChild(document.createTextNode(`Extra B: ${p.key}|${p.value}`)));
+
+            blockDiv.appendChild(secBox);
+        });
+
+        resultsDiv.appendChild(blockDiv);
+    });
+
+    buildMergedOutput(parsedA, parsedB);
+}
+
+// --- BUILD OUTPUT: apply positional conflicts ---
+function buildMergedOutput(parsedA, parsedB){
+    const blocksB = Object.fromEntries((parsedB || []).map(b => [b.id,b]));
+    const allBlocks = [...(parsedA || []).map(b=>b.id), ...((parsedB||[]).filter(b=>!(parsedA||[]).some(a=>a.id===b.id)).map(b=>b.id))];
+
+    const out = [];
+    allBlocks.forEach(blockId=>{
+        const A = (parsedA||[]).find(b=>b.id===blockId) || null;
+        const B = blocksB[blockId] || null;
+        const sectionsA = A ? Object.fromEntries(A.sections.map(s=>[s.id,s])) : {};
+        const sectionsB = B ? Object.fromEntries(B.sections.map(s=>[s.id,s])) : {};
+        const sectionOrder = [...(A?A.sections.map(s=>s.id):[]), ...Object.keys(sectionsB).filter(id=>!sectionsA[id])];
+
+        out.push(`${blockId} [`);
+        sectionOrder.forEach(secId=>{
+            const secA = sectionsA[secId] || {id:secId,pairs:[]};
+            const secB = sectionsB[secId] || {id:secId,pairs:[]};
+
+            const len = Math.max(secA.pairs.length, secB.pairs.length);
+            out.push(`    ${secId} (`);
+            for(let idx=0; idx<len; idx++){
+                const pairA = secA.pairs[idx];
+                const pairB = secB.pairs[idx];
+
+                if(pairA && pairB){
+                    // positional key
+                    let key = pairA.key;
+                    const mapKey = `${blockId}:${secId}:pos${idx}`;
+                    if(conflictSelections[mapKey]) key = conflictSelections[mapKey];
+
+                    // value
+                    let value = pairA.value;
+                    const valMapKey = `${blockId}:${secId}:${pairA.key}`;
+                    if(conflictSelections[valMapKey]) value = conflictSelections[valMapKey];
+
+                    out.push(`        ${key}|${value}`);
+                }
+                else if(pairA) out.push(`        ${pairA.key}|${pairA.value}`);
+                else if(pairB) out.push(`        ${pairB.key}|${pairB.value}`);
+            }
+            out.push(`    )`);
+        });
+        out.push(`]`);
+    });
+
+    document.getElementById('mergedOutput').value = out.join('\n');
+}
+
+
+// --- PARSER (bracket-aware, line-safe) ---
+function parseYW(input) {
+  const tokens = tokenize(input);
+  let i = 0;
+  function peek(offset = 0) { return tokens[i + offset]; }
+  function next() { return tokens[i++]; }
+
+  const blocks = [];
+
+  while (i < tokens.length) {
+    // skip leading NEWLINEs and unexpected tokens until an IDENT (block id)
+    while (i < tokens.length && (!peek() || (peek().type !== 'IDENT'))) i++;
+    if (i >= tokens.length) break;
+
+    const blockIdToken = next();
+    if (!blockIdToken || blockIdToken.type !== 'IDENT') break;
+    const blockId = blockIdToken.value;
+
+    // expect '[' after block id
+    if (!peek() || peek().type !== '[') throw new Error("Expected '[' after block id " + blockId);
+    next(); // consume '['
+
+    const sections = [];
+
+    // parse sections until matching ']' (allow NEWLINEs between)
+    while (i < tokens.length && peek() && peek().type !== ']') {
+      // skip NEWLINEs or stray tokens
+      if (peek().type === 'NEWLINE') { next(); continue; }
+      if (peek().type !== 'IDENT') {
+        // skip unexpected token and continue
+        next();
+        continue;
+      }
+
+      // section id
+      const secId = next().value;
+      // expect '('
+      if (!peek() || peek().type !== '(') throw new Error("Expected '(' after section id " + secId);
+      next(); // consume '('
+
+      // parse key|value pairs until ')'
+      const pairs = [];
+      while (i < tokens.length && peek() && peek().type !== ')') {
+        // skip NEWLINEs and stray tokens
+        if (peek().type === 'NEWLINE') { next(); continue; }
+        if (peek().type !== 'IDENT') {
+          // stray TEXT or other inside section: skip
+          next();
+          continue;
+        }
+
+        // key
+        const key = next().value;
+        // expect '|'
+        if (!peek() || peek().type !== '|') throw new Error("Expected '|' after key " + key);
+        next(); // consume '|'
+
+        // accumulate value tokens until end-of-line (NEWLINE) or until encountering ')' or ']' (section/block end)
+        let valParts = [];
+        while (i < tokens.length && peek()) {
+          const t = peek();
+          if (t.type === 'NEWLINE' || t.type === ')' || t.type === ']') break;
+          // include IDENT and TEXT tokens as part of the value
+          if (t.type === 'IDENT' || t.type === 'TEXT') {
+            valParts.push(t.value);
+            next();
+            continue;
+          }
+          // if we encounter other punctuation (unlikely) stop
+          if (t.type === '|' || t.type === '(' || t.type === '[' || t.type === ']' || t.type === ')') break;
+          // fallback: consume
+          next();
+        }
+
+        // consume a trailing NEWLINE if present (common case)
+        if (peek() && peek().type === 'NEWLINE') next();
+
+        const value = valParts.join(' ').trim();
+        pairs.push({ key, value });
+      }
+
+      // expect ')'
+      if (!peek() || peek().type !== ')') throw new Error('Unclosed section ' + secId + ' in block ' + blockId);
+      next(); // consume ')'
+
+      sections.push({ id: secId, pairs });
+      // skip an optional NEWLINE after section
+      if (peek() && peek().type === 'NEWLINE') next();
+    }
+
+    if (!peek() || peek().type !== ']') throw new Error('Unclosed block ' + blockId);
+    next(); // consume ']'
+    // skip trailing NEWLINE
+    if (peek() && peek().type === 'NEWLINE') next();
+
+    blocks.push({ id: blockId, sections });
+  }
+
+  return blocks;
+}
+
+// --- UTIL ---
+function sanitizeName(s) {
+  return (s || '').replace(/[^A-Za-z0-9_]/g, '_');
+}
+
+// --- MERGE & UI ---
+
+// event delegation for radio changes
+resultsDiv.addEventListener('change', function (e) {
+  const t = e.target;
+  if (t && t.type === 'radio' && t.dataset && t.dataset.mapKey) {
+    conflictSelections[t.dataset.mapKey] = t.value;
+    buildMergedOutput(parsedA_global, parsedB_global);
+  }
+});
+
+
+// Hook up buttons
+document.getElementById('mergeBtn').addEventListener('click', () => {
+  // store parsed globals after merge ran
+  try {
+    merge();
+    // keep parsedA_global and parsedB_global set inside merge
+    parsedA_global = parsedA_global || [];
+    parsedB_global = parsedB_global || [];
+  } catch (err) {
+    alert('Merge failed: ' + err.message);
+  }
+});
+
+// download
+document.getElementById('downloadBtn').addEventListener('click', () => {
+  const txt = document.getElementById('mergedOutput').value;
+  if (!txt) { alert('No merged output to download'); return; }
+  const blob = new Blob([txt], {type:'text/plain'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'merged.txt'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+});
+
+// Auto-merge live when toggling Auto-True
+document.getElementById('autoTrue').addEventListener('change', () => {
+  // re-run merge if inputs are present
+  const a = document.getElementById('inputA').value;
+  const b = document.getElementById('inputB').value;
+  if (a.trim() || b.trim()) {
+    // reset selections so new auto-true takes effect
+    conflictSelections = {};
+    try { merge(); } catch (e) { /* parse errors already alerted in merge() */ }
+  }
+});
+
+</script>
+</body>
+</html>
